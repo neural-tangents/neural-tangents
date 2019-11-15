@@ -1,5 +1,4 @@
 # Copyright 2019 The Neural Tangents Authors.  All rights reserved.
-
 """General-purpose internal utilities."""
 
 from jax.api import jit
@@ -10,6 +9,7 @@ from collections import namedtuple
 from functools import wraps
 import inspect
 import types
+import six
 
 
 def _jit_vmap(f):
@@ -19,7 +19,9 @@ def _jit_vmap(f):
 def stub_out_pmap(batch, count):
   # If we are using GPU or CPU stub out pmap with vmap to simulate multi-core.
   if count > 0:
+
     class xla_bridge_stub(object):
+
       def device_count(self):
         return count
 
@@ -31,8 +33,9 @@ def stub_out_pmap(batch, count):
 
 def assert_close_matrices(self, expected, actual, rtol):
   self.assertEqual(expected.shape, actual.shape)
-  relative_error = (np.linalg.norm(actual - expected) /
-                    np.maximum(np.linalg.norm(expected), 1e-12))
+  relative_error = (
+      np.linalg.norm(actual - expected) /
+      np.maximum(np.linalg.norm(expected), 1e-12))
   if relative_error > rtol or np.isnan(relative_error):
     self.fail(self.failureException(float(relative_error), expected, actual))
   else:
@@ -40,7 +43,12 @@ def assert_close_matrices(self, expected, actual, rtol):
 
 
 def canonicalize_get(get):
+  if get is None:
+    return True, get
+
   if not get:
+    # NOTE: It seems slightly nicer to not support the empty-tuple
+    # case. Happy to add support later, if there's a use-case.
     raise ValueError('"get" must be non-empty.')
 
   get_is_not_tuple = isinstance(get, str)
@@ -49,12 +57,13 @@ def canonicalize_get(get):
 
   get = tuple(s.lower() for s in get)
   if len(set(get)) < len(get):
-    raise ValueError(
-        'All entries in "get" must be unique. Got {}'.format(get))
+    raise ValueError('All entries in "get" must be unique. Got {}'.format(get))
   return get_is_not_tuple, get
 
 
 _KERNEL_NAMED_TUPLE_CACHE = {}
+
+
 def named_tuple_factory(name, get):
   key = (name, get)
   if key in _KERNEL_NAMED_TUPLE_CACHE:
@@ -64,14 +73,27 @@ def named_tuple_factory(name, get):
     return named_tuple_factory(name, get)
 
 
+def _output_to_dict(output):
+  if isinstance(output, dict):
+    return output
+
+  if hasattr(output, '_asdict'):
+    return output._asdict()
+
+  if isinstance(output, types.GeneratorType):
+    return (_output_to_dict(out) for out in output)
+
+  raise ValueError(type(output))
+
+
 def get_namedtuple(name):
   def getter_decorator(fn):
     try:
-      get_index = inspect.getargspec(fn).args.index('get')
-      defaults = inspect.getargspec(fn).defaults
+      argspec = _argspec(fn)
+      get_index = argspec.args.index('get')
+      defaults = argspec.defaults
     except:
-      raise ValueError(
-          '`get_namedtuple` functions must have a `get` argument.')
+      raise ValueError('`get_namedtuple` functions must have a `get` argument.')
 
     @wraps(fn)
     def getter_fn(*args, **kwargs):
@@ -81,17 +103,25 @@ def get_namedtuple(name):
         get_is_not_tuple, get = canonicalize_get(kwargs['get'])
         kwargs['get'] = get
       elif get_index < len(args):
-          get_is_not_tuple, get = canonicalize_get(args[get_index])
-          canonicalized_args[get_index] = get
+        get_is_not_tuple, get = canonicalize_get(args[get_index])
+        canonicalized_args[get_index] = get
       elif defaults is None:
         raise ValueError(
             '`get_namedtuple` function must have a `get` argument provided or'
             'set by default.')
       else:
-        get_is_not_tuple, get = canonicalize_get(
-            defaults[get_index - len(args)])
+        get_is_not_tuple, get = canonicalize_get(defaults[get_index -
+                                                          len(args)])
 
       fn_out = fn(*canonicalized_args, **kwargs)
+
+      if get is None:
+        if isinstance(fn_out, dict):
+          ReturnType = named_tuple_factory(name, tuple(fn_out.keys()))
+          fn_out = ReturnType(*fn_out.values())
+        return fn_out
+
+      fn_out = _output_to_dict(fn_out)
 
       if get_is_not_tuple:
         if isinstance(fn_out, types.GeneratorType):
@@ -101,10 +131,18 @@ def get_namedtuple(name):
 
       ReturnType = named_tuple_factory(name, get)
       if isinstance(fn_out, types.GeneratorType):
-        return (ReturnType(*tuple(output[g] for g in get))
-                for output in fn_out)
+        return (ReturnType(*tuple(output[g] for g in get)) for output in fn_out)
       else:
         return ReturnType(*tuple(fn_out[g] for g in get))
 
     return getter_fn
+
   return getter_decorator
+
+
+def _argspec(func):
+  """Python 2 and 3 compatible argspec."""
+  if six.PY3:
+    return inspect.getfullargspec(func)
+  else:
+    return inspect.getargspec(func)

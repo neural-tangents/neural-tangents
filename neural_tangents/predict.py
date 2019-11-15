@@ -1,20 +1,26 @@
 # Copyright 2019 The Neural Tangents Authors.  All rights reserved.
-
 """Functions to make predictions on the test set using NTK kernel."""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
+
 import collections
 import functools
+
 from jax.api import grad
+from jax.api import jit
 from jax.lib import xla_bridge
 import jax.numpy as np
 import jax.scipy as sp
+
+from jax.tree_util import tree_all
+from jax.tree_util import tree_map
 from neural_tangents.utils import empirical
 from neural_tangents.utils.utils import canonicalize_get
-from neural_tangents.utils.utils import named_tuple_factory
 from neural_tangents.utils.utils import get_namedtuple
+from neural_tangents.utils.utils import named_tuple_factory
+import scipy as osp
 from scipy.integrate._ode import ode
 
 
@@ -89,7 +95,7 @@ def gradient_descent_mse(g_dd, y_train, g_td=None, diag_reg=0.):
   normalization = y_train.size
   output_dimension = y_train.shape[-1]
   expm1_fn, inv_expm1_fn = (_make_expm1_fn(normalization),
-                                _make_inv_expm1_fn(normalization))
+                            _make_inv_expm1_fn(normalization))
 
   def fl(fx):
     """Flatten outputs."""
@@ -147,7 +153,7 @@ def gradient_descent(g_dd, y_train, loss, g_td=None):
 
   This function uses the scipy ode solver with the 'dopri5' algorithm.
 
-  [*] https://arxiv.org/abs/1806.07572
+  [*] https://arxiv.org/abs/1902.06720
 
   Example:
     ```python
@@ -281,7 +287,7 @@ def momentum(g_dd, y_train, loss, learning_rate, g_td=None, momentum=0.9):
 
   This function uses the scipy ode solver with the 'dopri5' algorithm.
 
-  [*] https://arxiv.org/abs/1806.07572
+  [*] https://arxiv.org/abs/1902.06720
 
   Example:
     ```python
@@ -445,63 +451,118 @@ def momentum(g_dd, y_train, loss, learning_rate, g_td=None, momentum=0.9):
   return init_fn, predict_fn, get_fn
 
 
-@get_namedtuple('GPInference')
 def gp_inference(kernel_fn,
                  x_train,
                  y_train,
                  x_test,
                  get,
                  diag_reg=0.,
-                 compute_var=False):
+                 compute_cov=False):
   """Compute the mean and variance of the `posterior` of NNGP and NTK.
+
+  Note that this method is equivalent to `gradient_descent_mse_gp` at infinite
+  time. Example:
+  ```python
+  >>> predict = gradient_descent_mse_gp(kernel_fn, x_train, y_train, x_test,
+  >>>                                   get, diag_reg, compute_cov)
+  >>> predict(np.inf) == predict(None) == gp_inference(kernel_fn, x_train,
+  >>>     y_train, x_test, get, diag_reg, compute_cov)
+  ```
 
   Args:
     kernel_fn: A kernel function that computes NNGP and NTK.
     x_train: A `np.ndarray`, representing the training data.
     y_train: A `np.ndarray`, representing the labels of the training data.
     x_test: A `np.ndarray`, representing the test data.
-    diag_reg: A float, representing the strength of the regularization.
     get: string, the mode of the Gaussian process, either "nngp" or "ntk", or a
-      tuple.
-    compute_var: A boolean. If `True` computing both `mean` and `variance` and
+      tuple, or None. If `None` then both `nngp` and `ntk` predictions are
+      returned.
+    diag_reg: A float, representing the strength of the regularization.
+    compute_cov: A boolean. If `True` computing both `mean` and `variance` and
       only `mean` otherwise.
 
   Returns:
     Either a Gaussian(`mean`, `variance`) namedtuple or `mean` of the GP
     posterior.
   """
+  if get is None:
+    get = ('nngp', 'ntk')
+  kdd, ktd, ktt = _get_matrices(kernel_fn, x_train, x_test, get, compute_cov)
+  gp_inference_mat = (_gp_inference_mat_jit_cpu if _is_on_cpu(kdd) else
+                      _gp_inference_mat_jit)
+  return gp_inference_mat(kdd, ktd, ktt, y_train, get, diag_reg)
+
+
+@get_namedtuple('Gaussians')
+def _gp_inference_mat(kdd,
+                      ktd,
+                      ktt,
+                      y_train,
+                      get,
+                      diag_reg=0.):
+  """Compute the mean and variance of the `posterior` of NNGP and NTK.
+
+  Args:
+    kdd: A train-train `Kernel` namedtuple.
+    ktd: A test-train `Kernel` namedtuple.
+    ktt: A test-test `Kernel` namedtuple.
+    y_train: A `np.ndarray`, representing the train targets.
+    get: string, the mode of the Gaussian process, either "nngp" or "ntk", or a
+      tuple, or `None`. If `None` then both `nngp` and `ntk` predictions are
+      returned.
+    diag_reg: A float, representing the strength of the regularization.
+
+  Returns:
+    Either a Gaussian(`mean`, `variance`) namedtuple or `mean` of the GP
+    posterior.
+  """
   out = {}
-  get_dependency = _get_dependency(compute_var, get)
-
-  kdd = kernel_fn(x_train, None, get_dependency)
-  ktd = kernel_fn(x_test, x_train, get_dependency)
-  if compute_var:
-    ktt = kernel_fn(x_test, x_test, 'nngp')
-
+  if get is None:
+    get = ('nngp', 'ntk')
   if 'nngp' in get:
     op = _inv_operator(kdd.nngp, diag_reg)
     pred_mean = _mean_prediction(op, ktd.nngp, y_train)
-    if compute_var:
-      pred_var = _nngp_var(op, ktd.nngp, ktt)
-    out['nngp'] = Gaussian(pred_mean, pred_var) if compute_var else pred_mean
+    if ktt is not None:
+      pred_cov = _nngp_cov(op, ktd.nngp, ktt)
+    out['nngp'] = (
+        Gaussian(pred_mean, pred_cov) if ktt is not None else pred_mean)
 
   if 'ntk' in get:
     op = _inv_operator(kdd.ntk, diag_reg)
     pred_mean = _mean_prediction(op, ktd.ntk, y_train)
-    if compute_var:
-      pred_var = _ntk_var(op, ktd.ntk, kdd.nngp, ktd.nngp, ktt)
-    out['ntk'] = Gaussian(pred_mean, pred_var) if compute_var else pred_mean
+    if ktt is not None:
+      pred_cov = _ntk_cov(op, ktd.ntk, kdd.nngp, ktd.nngp, ktt)
+    out['ntk'] = Gaussian(pred_mean, pred_cov) if ktt is not None else pred_mean
 
   return out
 
 
+_gp_inference_mat_jit = jit(_gp_inference_mat, static_argnums=(4,))
+
+
+_gp_inference_mat_jit_cpu = jit(_gp_inference_mat, static_argnums=(4,),
+                                backend='cpu')
+
+
+def _get_matrices(kernel_fn, x_train, x_test, get, compute_cov):
+  get = _get_dependency(get, compute_cov)
+  kdd = kernel_fn(x_train, None, get)
+  ktd = kernel_fn(x_test, x_train, get)
+  if compute_cov:
+    ktt = kernel_fn(x_test, x_test, 'nngp')
+  else:
+    ktt = None
+  return kdd, ktd, ktt
+
+
+# TODO: Refactor this method to make use of @getter.
 def gradient_descent_mse_gp(kernel_fn,
                             x_train,
                             y_train,
                             x_test,
-                            get=('nngp', 'ntk'),
+                            get,
                             diag_reg=0.0,
-                            compute_var=False):
+                            compute_cov=False):
   """Predicts the gaussian embedding induced by gradient descent with mse loss.
 
   This is equivalent to an infinite ensemble of networks after marginalizing
@@ -512,99 +573,128 @@ def gradient_descent_mse_gp(kernel_fn,
     x_train: A `np.ndarray`, representing the training data.
     y_train: A `np.ndarray`, representing the labels of the training data.
     x_test: A `np.ndarray`, representing the test data.
-    diag_reg: A float, representing the strength of the regularization.
     get: string, the mode of the Gaussian process, either "nngp" or "ntk", or
       a tuple.
-    compute_var: A boolean. If `True` computing both `mean` and `variance` and
+    diag_reg: A float, representing the strength of the regularization.
+    compute_cov: A boolean. If `True` computing both `mean` and `variance` and
       only `mean` otherwise.
 
   Returns:
     A function that predicts the gaussian parameters at t:
-      prediction(t) -> Gaussian(mean, variance).
-      If compute_var is False, only returns the mean.
+      predict(t) -> Gaussian(mean, variance).
+      If compute_cov is False, only returns the mean.
   """
+  if get is None:
+    get = ('nngp', 'ntk')
   if isinstance(get, str):
+    # NOTE: This seems like an ugly solution that involves an extra
+    # indirection. It might be nice to clean it up.
     return lambda t: gradient_descent_mse_gp(
-        kernel_fn, x_train, y_train, x_test,
-        diag_reg=diag_reg, get=(get,), compute_var=compute_var)(t)[0]
+        kernel_fn,
+        x_train,
+        y_train,
+        x_test,
+        diag_reg=diag_reg,
+        get=(get,),
+        compute_cov=compute_cov)(t)[0]
 
   _, get = canonicalize_get(get)
-  get_dependency = _get_dependency(compute_var, get)
-
-  kdd = kernel_fn(x_train, None, get_dependency)
-  ktd = kernel_fn(x_test, x_train, get_dependency)
-  if compute_var:
-    ktt = kernel_fn(x_test, None, 'nngp')
 
   normalization = y_train.size
   op_fn = _make_inv_expm1_fn(normalization)
 
   eigenspace = {}
-  for g in get:
-    k = kdd.nngp if g == 'nngp' else kdd.ntk
-    k_dd_plus_reg = _add_diagonal_regularizer(k, diag_reg)
-    eigenspace[g] = _eigh(k_dd_plus_reg)
 
-  def prediction(t):
+  kdd, ktd, ktt = _get_matrices(kernel_fn, x_train, x_test, get, compute_cov)
+  gp_inference_mat = (_gp_inference_mat_jit_cpu if _is_on_cpu(kdd) else
+                      _gp_inference_mat_jit)
+
+  @_jit_cpu(kdd)
+  def predict(t=None):
+    """`t=None` is equivalent to infinite time and calls `gp_inference`."""
+    if t is None:
+      return gp_inference_mat(kdd, ktd, ktt, y_train, get, diag_reg)
+
+    if not eigenspace:
+      for g in get:
+        k = kdd.nngp if g == 'nngp' else kdd.ntk
+        k_dd_plus_reg = _add_diagonal_regularizer(k, diag_reg)
+        eigenspace[g] = _eigh(k_dd_plus_reg)
+
     out = {}
 
     if 'nngp' in get:
       evals, evecs = eigenspace['nngp']
-      op_evals = -op_fn(evals, 2 * t)
+      op_evals = -op_fn(evals, t)
       pred_mean = _mean_prediction_einsum(evecs, op_evals, ktd.nngp, y_train)
-      if compute_var:
-        pred_var = ktt - np.einsum(
+      if compute_cov:
+        op_evals_x2 = -op_fn(evals, 2 * t)
+        pred_cov = ktt - np.einsum(
             'mj,ji,i,ki,lk->ml',
-            ktd.nngp, evecs, op_evals, evecs, ktd.nngp, optimize=True)
+            ktd.nngp,
+            evecs,
+            op_evals_x2,
+            evecs,
+            ktd.nngp,
+            optimize=True)
 
-      out['nngp'] = Gaussian(pred_mean, pred_var) if compute_var else pred_mean
+      out['nngp'] = Gaussian(pred_mean, pred_cov) if compute_cov else pred_mean
 
     if 'ntk' in get:
       evals, evecs = eigenspace['ntk']
       op_evals = -op_fn(evals, t)
       pred_mean = _mean_prediction_einsum(evecs, op_evals, ktd.ntk, y_train)
-      if compute_var:
+      if compute_cov:
         # inline the covariance calculation with einsum.
-        pred_var = np.einsum(
+        term_1 = np.einsum(
+            'mi,i,ki,lk->ml', evecs, op_evals, evecs, ktd.ntk, optimize=True)
+        pred_cov = np.einsum(
+            'ji,jk,kl->il', term_1, kdd.nngp, term_1, optimize=True)
+        term_2 = np.einsum(
             'mj,ji,i,ki,lk->ml',
-            kdd.nngp, evecs, op_evals, evecs, ktd.ntk, optimize=True)
-        pred_var -= 2. * np.transpose(ktd.nngp)
-        pred_var = np.einsum(
-            'mj,ji,i,ki,kl->ml',
-            ktd.ntk, evecs, op_evals, evecs, pred_var, optimize=True)
-        pred_var = pred_var + ktt
+            ktd.ntk,
+            evecs,
+            op_evals,
+            evecs,
+            ktd.nngp,
+            optimize=True)
+        term_2 += np.transpose(term_2)
+        pred_cov += (-term_2 + ktt)
 
-      out['ntk'] = Gaussian(pred_mean, pred_var) if compute_var else pred_mean
+      out['ntk'] = Gaussian(pred_mean, pred_cov) if compute_cov else pred_mean
 
-    returntype = named_tuple_factory('GPGradientDescent', get)
+    returntype = named_tuple_factory('Gaussians', get)
     return returntype(*tuple(out[g] for g in get))
 
-  return prediction
+  return predict
 
 
 ## Utility functions
-
-
-def _get_dependency(compute_var, get):
+def _get_dependency(get, compute_cov):
+  """Figure out dependency for get."""
+  _, get = canonicalize_get(get)
   for g in get:
     if g not in ['nngp', 'ntk']:
       raise NotImplementedError(
-          'Can only get either "nngp" or "ntk" predictions.')
+          'Can only get either "nngp" or "ntk" predictions, got %s.' % g)
   get_dependency = ()
-  if 'nngp' in get or ('ntk' in get and compute_var):
-    get_dependency = get_dependency + ('nngp',)
+  if 'nngp' in get or ('ntk' in get and compute_cov):
+    get_dependency += ('nngp',)
   if 'ntk' in get:
-    get_dependency = get_dependency + ('ntk',)
+    get_dependency += ('ntk',)
   return get_dependency
 
 
 def _eigh(mat):
   """Platform specific eigh."""
+  # TODO: Eventually, we may want to handle non-symmetric kernels for
+  # e.g. masking. Additionally, once JAX supports eigh on TPU, we probably want
+  # to switch to JAX's eigh.
   if xla_bridge.get_backend().platform == 'tpu':
     eigh = np.onp.linalg.eigh
   else:
     eigh = np.linalg.eigh
-
+    eigh = jit(eigh, backend='cpu') if _is_on_cpu(mat) else jit(eigh)
   return eigh(mat)
 
 
@@ -681,7 +771,7 @@ def _mean_prediction(op, g_td, y_train):
       training data.
 
   Returns:
-    The mean prediction of the GP.  `g_td @ op @ y_train`.
+    The mean prediction of the GP. `g_td @ op @ y_train`.
   """
   fl, ufl = _make_flatten_uflatten(g_td, y_train)
 
@@ -700,29 +790,30 @@ def _mean_prediction_einsum(evecs, op_evals, g_td, y_train):
   return ufl(mean_pred)
 
 
-def _ntk_var(op, ntk_td, nngp_dd, nngp_td, nngp_tt):
+def _ntk_cov(op, ntk_td, nngp_dd, nngp_td, nngp_tt):
   """Compute the covariance in the ntk approximation."""
   # op(vec) here should compute \Theta^{-1} @ (I - e^{-\Theta dt}) @ vec
   # for the time dependent case and
   # op(vec) = \Theta^{-1} @ vec for the infinite time case.
-  # below implements Equation 15 from 1902.06720
-  var = op(np.transpose(ntk_td))
-  var = np.dot(nngp_dd, var)
-  var -= 2. * np.transpose(nngp_td)
-  var = op(var)
-  var = np.dot(ntk_td, var) + nngp_tt
-  return var
+  # below implements Equation 15 from https://arxiv.org/abs/1902.06720
+  term_1 = op(np.transpose(ntk_td))
+  cov = np.dot(nngp_dd, term_1)
+  cov = np.dot(np.transpose(term_1), cov)
+  term_2 = np.dot(ntk_td, op(np.transpose(nngp_td)))
+  term_2 += np.transpose(term_2)
+  cov += (-term_2 + nngp_tt)
+  return cov
 
 
-def _nngp_var(op, g_td, g_tt):
+def _nngp_cov(op, g_td, g_tt):
   """Compute the covariance in the nngp approximation."""
   # op(vec) here should compute K^{-1} @ (I - e^{-2 K dt}) @ vec
   # for the time dependent case or
   # op(vec) = K^{-1} @ vec
   # for infinite time.
-  # below implements Equation S23 from 1902.06720
-  var = op(np.transpose(g_td))
-  return g_tt - np.dot(g_td, var)
+  # below implements Equation S23 from https://arxiv.org/abs/1902.06720
+  cov = op(np.transpose(g_td))
+  return g_tt - np.dot(g_td, cov)
 
 
 def _make_expm1_fn(normalization):
@@ -743,3 +834,68 @@ def _make_inv_expm1_fn(normalization):
     return expm1_fn(evals, dt) / np.abs(evals)
 
   return _inv_expm1_fn
+
+
+def _arr_is_on_cpu(x):
+  # TODO: revisit when https://github.com/google/jax/issues/1431 and
+  # https://github.com/google/jax/issues/1432 are fixed.
+  if hasattr(x, 'device_buffer'):
+    return 'CPU' in str(x.device_buffer.device())
+
+  if isinstance(x, np.ndarray):
+    return True
+
+  raise NotImplementedError(type(x))
+
+
+def _is_on_cpu(x):
+  return tree_all(tree_map(_arr_is_on_cpu, x))
+
+
+def _jit_cpu(x):
+  def jit_cpu(f):
+    if _is_on_cpu(x):
+      return jit(f, backend='cpu')
+    return jit(f)
+  return jit_cpu
+
+
+def max_learning_rate(kdd, num_outputs=-1, eps=1e-12):
+  r"""Computing the maximal feasible learning rate for infinite width NNs.
+
+  The network is assumed to be trained using SGD or full-batch GD with mean
+  squared loss. The loss is assumed to have the form
+  `1/(2 * batch_size * num_outputs) \|f(train_x) - train_y\|^2`. The maximal
+  feasible learning rate is the largest `\eta` such that the operator
+  `(I - \eta / (batch_size * num_outputs) * NTK)` is a contraction, which is
+  '2 * batch_size * num_outputs * lambda_max(NTK)'.
+
+  Args:
+    kdd: The analytic or empirical NTK of (train_x, train_x).
+    num_outputs: The number of outputs of the neural network. If `kdd` is the
+      analytic ntk, `num_outputs` must be provided. Otherwise `num_outputs=-1`
+      and `num_outputs` is computed via the size of `kdd`.
+    eps: A float to avoid zero divisor.
+
+  Returns:
+    The maximal feasible learning rate for infinite width NNs.
+  """
+
+  if kdd.ndim not in [2, 4]:
+    raise ValueError('`kdd` must be a 2d or 4d tensor.')
+  if kdd.ndim == 2 and num_outputs == -1:
+    raise ValueError('`num_outputs` must be provided for theoretical kernel.')
+  if kdd.ndim == 2:
+    factor = kdd.shape[0] * num_outputs
+  else:
+    kdd = empirical.flatten_features(kdd)
+    factor = kdd.shape[0]
+  if kdd.shape[0] != kdd.shape[1]:
+    raise ValueError('`kdd` must be a square matrix.')
+  if _is_on_cpu(kdd):
+    max_eva = osp.linalg.eigh(kdd, eigvals_only=True,
+                              eigvals=(kdd.shape[0] - 1, kdd.shape[0] - 1))[-1]
+  else:
+    max_eva = _eigh(kdd)[0][-1]
+  lr = 2 * factor / (max_eva + eps)
+  return lr

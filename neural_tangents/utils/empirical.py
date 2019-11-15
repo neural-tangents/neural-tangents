@@ -20,7 +20,7 @@ from neural_tangents.utils import flags as internal_flags
 from neural_tangents.utils.utils import get_namedtuple
 
 
-config.parse_flags_with_absl()
+config.parse_flags_with_absl()  # NOTE: Is this safe?
 
 
 FLAGS = flags.FLAGS
@@ -126,6 +126,7 @@ def empirical_implicit_ntk_fn(f):
   to fx_dummy for the outputs of the network. fx_dummy has the same shape as
   the output of the network on a single piece of input data.
 
+  TODO: Write up a better description of the implicit method.
 
   Args:
     f: The function whose NTK we are computing. f should have the signature
@@ -215,6 +216,8 @@ def empirical_direct_ntk_fn(f):
       j2 = jac_fn(params, x2)
 
     ntk = sum_and_contract(j1, j2)
+    # TODO: If we care, this will not work if the output is not of
+    # shape [n, output_dim].
     return np.transpose(ntk, (0, 2, 1, 3))
 
   return ntk_fn
@@ -287,21 +290,24 @@ def empirical_kernel_fn(f):
   }
 
   @get_namedtuple('EmpiricalKernel')
-  def kernel_fn(x1, x2, params, get=('nngp', 'ntk')):
+  def kernel_fn(x1, x2, params, get=None):
     """Returns a draw from the requested empirical kernels.
 
     Args:
       x1: An ndarray of shape [n1,] + input_shape.
       x2: An ndarray of shape [n2,] + input_shape.
       params: A PyTree of parameters for the function `f`.
-      get: either a string or a tuple of strings specifying which data should
-        be returned by the kernel function. Can be "nngp" or "ntk".
+      get: either None, a string, a tuple of strings specifying which data
+        should be returned by the kernel function. Can be "nngp" or "ntk". If
+        `None` then both "nngp" and "ntk" are returned.
 
     Returns:
       If `get` is a string, returns the requested `np.ndarray`. If `get` is a
       tuple, returns an `EmpiricalKernel` namedtuple containing only the
       requested information.
     """
+    if get is None:
+      get = ('nngp', 'ntk')
     return {g: kernel_fns[g](x1, x2, params) for g in get}
 
   return kernel_fn

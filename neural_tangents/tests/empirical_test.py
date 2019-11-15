@@ -102,6 +102,7 @@ class EmpiricalTest(jtu.JaxTestCase):
       x = random.normal(split, (shape[-1],))
       self.assertAllClose(f_lin_exact(x0, x, params), f_lin(x, params), True)
 
+  # pylint: disable=g-complex-comprehension
   @jtu.parameterized.named_parameters(
       jtu.cases_from_list({
           'testcase_name': '_{}'.format(shape),

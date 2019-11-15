@@ -1,5 +1,4 @@
 # Copyright 2019 The Neural Tangents Authors.  All rights reserved.
-
 """Tests for the Neural Tangents library."""
 
 from __future__ import absolute_import
@@ -23,6 +22,8 @@ STANDARD = 'FLAT'
 POOLING = 'POOLING'
 INTERMEDIATE_CONV = 'INTERMEDIATE_CONV'
 
+# TODO: Add a pooling test when multiple inputs are supported in
+# Conv + Pooling.
 TRAIN_SHAPES = [(4, 4), (4, 8), (8, 8), (8, 4, 4, 3), (4, 4, 4, 3)]
 TEST_SHAPES = [(2, 4), (6, 8), (16, 8), (2, 4, 4, 3), (2, 4, 4, 3)]
 NETWORK = [STANDARD, STANDARD, STANDARD, STANDARD, INTERMEDIATE_CONV]
@@ -65,7 +66,7 @@ def _theoretical_kernel(unused_key, input_shape, network, just_theta):
 
   @jit
   def kernel_fn(x1, x2=None):
-    get_all = ('ntk', 'nngp', 'var1', 'var2', 'is_gaussian', 'is_height_width')
+    get_all = None
     k = _kernel_fn(x1, x2, 'ntk') if just_theta else _kernel_fn(x1, x2, get_all)
     return k
 
@@ -80,36 +81,20 @@ KERNELS['theoretical'] = partial(_theoretical_kernel, just_theta=True)
 KERNELS['theoretical_pytree'] = partial(_theoretical_kernel, just_theta=False)
 
 
-def _test_kernel_against_batched(cls, kernel_fn, batched_kernel_fn, train, test):
-
+def _test_kernel_against_batched(cls, kernel_fn, batched_kernel_fn, train,
+                                 test):
   g = kernel_fn(train, None)
   g_b = batched_kernel_fn(train, None)
-
-  if hasattr(g, '_asdict'):
-    g_dict = g._asdict()
-    g_b_dict = g_b._asdict()
-    assert set(g_dict.keys()) == set(g_b_dict.keys())
-    for k in g_dict:
-      if k != 'var2':
-        cls.assertAllClose(g_dict[k], g_b_dict[k], check_dtypes=True)
-  else:
-    cls.assertAllClose(g, g_b, check_dtypes=True)
+  cls.assertAllClose(g, g_b, check_dtypes=True)
 
   g = kernel_fn(train, test)
   g_b = batched_kernel_fn(train, test)
-
-  if hasattr(g, '_asdict'):
-    g_dict = g._asdict()
-    g_b_dict = g_b._asdict()
-    assert set(g_dict.keys()) == set(g_b_dict.keys())
-    for k in g_dict:
-      cls.assertAllClose(g_dict[k], g_b_dict[k], check_dtypes=True)
-  else:
-    cls.assertAllClose(g, g_b, check_dtypes=True)
+  cls.assertAllClose(g, g_b, check_dtypes=True)
 
 
 class BatchTest(jtu.JaxTestCase):
 
+  # pylint: disable=g-complex-comprehension
   @jtu.parameterized.named_parameters(
       jtu.cases_from_list(
           {
@@ -192,8 +177,7 @@ class BatchTest(jtu.JaxTestCase):
                 kernel_fn
           }
           for train, test, network in zip(TRAIN_SHAPES, TEST_SHAPES, NETWORK)
-          for name, kernel_fn in KERNELS.items()
-          if len(train) == 2))
+          for name, kernel_fn in KERNELS.items()))
   def testComposition(self, train_shape, test_shape, network, name, kernel_fn):
     utils.stub_out_pmap(batch, 2)
 
@@ -249,8 +233,60 @@ class BatchTest(jtu.JaxTestCase):
     _test_kernel_against_batched(self, kernel_fn, kernel_batched, data_self,
                                  data_other)
 
+  def _test_analytic_kernel_composition(self, batching_fn):
+    rng = random.PRNGKey(0)
+    rng_self, rng_other = random.split(rng)
+    x_self = random.normal(rng_self, (8, 10))
+    x_other = random.normal(rng_other, (20, 10))
+    Block = stax.serial(stax.Dense(256), stax.Relu())
+
+    _, _, ker_fn = Block
+    ker_fn = batching_fn(ker_fn)
+
+    _, _, composed_ker_fn = stax.serial(Block, Block)
+
+    ker_out = ker_fn(ker_fn(x_self))
+    composed_ker_out = composed_ker_fn(x_self)
+    self.assertAllClose(ker_out, composed_ker_out, True)
+
+    ker_out = ker_fn(ker_fn(x_self, x_other))
+    composed_ker_out = composed_ker_fn(x_self, x_other)
+    self.assertAllClose(ker_out, composed_ker_out, True)
+
+  @jtu.parameterized.named_parameters(
+      jtu.cases_from_list(
+          {
+              'testcase_name':
+                '_on_device={}'.format(store_on_device),
+              'store_on_device':
+                store_on_device,
+          }
+          for store_on_device in [True, False]))
+  def testAnalyticKernelComposeSerial(self, store_on_device):
+    self._test_analytic_kernel_composition(
+        partial(batch._serial, batch_size=2, store_on_device=store_on_device))
+
+  def testAnalyticKernelComposeParallel(self):
+    utils.stub_out_pmap(batch, 2)
+    self._test_analytic_kernel_composition(batch._parallel)
+
+  @jtu.parameterized.named_parameters(
+      jtu.cases_from_list(
+          {
+              'testcase_name':
+                '_on_device={}'.format(store_on_device),
+              'store_on_device':
+                store_on_device,
+          }
+          for store_on_device in [True, False]))
+  def testAnalyticKernelComposeAutomatic(self, store_on_device):
+    utils.stub_out_pmap(batch, 2)
+    self._test_analytic_kernel_composition(
+        partial(batch.batch, batch_size=2, store_on_device=store_on_device))
+
   def test_jit_or_pmap_broadcast(self):
-    def kernel_fn(x1, x2, do_flip, keys, do_square, params, _unused=None, p=0.65):
+    def kernel_fn(x1, x2, do_flip, keys, do_square, params, _unused=None,
+                  p=0.65):
       res = np.abs(np.matmul(x1, x2))
       if do_square:
         res *= res
